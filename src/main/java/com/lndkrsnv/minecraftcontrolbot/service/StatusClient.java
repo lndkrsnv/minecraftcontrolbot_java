@@ -17,9 +17,14 @@ public class StatusClient {
         this.objectMapper = objectMapper;
     }
 
-    public StatusResponse fetchStatus() {
+    public StatusResponse fetchStatus(String serverId) {
+        var server = props.servers().get(serverId);
+        if (server == null) {
+            throw new IllegalArgumentException("Unknown status serverId: " + serverId);
+        }
+
         String raw = client.get()
-                .uri(props.url())
+                .uri(server.url())
                 .retrieve()
                 .body(String.class);
 

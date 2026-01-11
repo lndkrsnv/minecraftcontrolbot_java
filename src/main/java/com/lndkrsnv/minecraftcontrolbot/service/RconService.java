@@ -15,8 +15,12 @@ public class RconService {
         this.props = props;
     }
 
-    public synchronized void command(String cmd) {
-        try (Rcon rcon = new Rcon(props.host(), props.port(), props.password())) {
+    public void command(String serverId, String cmd) {
+        var server = props.servers().get(serverId);
+        if (server == null) {
+            throw new IllegalArgumentException("Unknown serverId: " + serverId);
+        }
+        try (Rcon rcon = new Rcon(server.host(), server.port(), server.password())) {
             rcon.command(cmd);
         } catch (IOException | AuthenticationException e) {
             throw new RuntimeException(e);
