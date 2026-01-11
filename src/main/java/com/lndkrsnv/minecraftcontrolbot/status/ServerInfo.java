@@ -5,6 +5,5 @@ public record ServerInfo(
         String hostname,
         String ipaddress,
         int port,
-        int queryport,
-        int latency
+        int queryport
 ) {}

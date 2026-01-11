@@ -25,10 +25,6 @@ public class StatusFormatter {
         if (max != null && max > 0) sb.append("Игроки: ").append(online).append("/").append(max).append("\n\n");
         else sb.append("Игроки: ").append(online).append("\n\n");
 
-        if (s.server() != null) {
-            sb.append("Latency: ").append(s.server().latency()).append(" ms").append("\n\n");
-        }
-
         if (s.players() != null && s.players().sample() != null && !s.players().sample().isEmpty()) {
             for (var p : s.players().sample()) {
                 sb.append(" • ").append(p.name()).append("\n");
