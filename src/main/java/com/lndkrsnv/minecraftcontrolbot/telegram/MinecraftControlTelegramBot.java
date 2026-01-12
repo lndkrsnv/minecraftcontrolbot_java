@@ -66,10 +66,14 @@ public class MinecraftControlTelegramBot extends TelegramLongPollingBot {
         long chatId = msg.getChatId();
         long userId = msg.getFrom().getId();
         String text = msg.getText();
+
+        if (!isCommandForBot(text)) {
+            return;
+        }
+
         String serverId = String.valueOf(selectedServerByChat.get(chatId));
 
         log.info(serverId);
-
         log.info("chat_id={} user_id={} username={} text={} serverId={}", chatId, userId, msg.getFrom().getUserName(), text, serverId);
 
         var action = pending.get(chatId);
@@ -179,6 +183,10 @@ public class MinecraftControlTelegramBot extends TelegramLongPollingBot {
         } catch (TelegramApiException e) {
             log.warn("Telegram send error", e);
         }
+    }
+
+    private boolean isCommandForBot(String text) {
+        return text != null && text.startsWith("/");
     }
 
     private String stripBotUsername(String text) {
