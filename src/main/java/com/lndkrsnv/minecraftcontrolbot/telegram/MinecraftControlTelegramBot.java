@@ -67,20 +67,20 @@ public class MinecraftControlTelegramBot extends TelegramLongPollingBot {
         long userId = msg.getFrom().getId();
         String text = msg.getText();
 
+        String serverId = String.valueOf(selectedServerByChat.get(chatId));
+
+        var action = pending.get(chatId);
+        if (action != null) {
+            log.info("chat_id={} user_id={} username={} text={} serverId={} [pending action {}]", chatId, userId, msg.getFrom().getUserName(), text, serverId, action);
+            handlePending(chatId, userId, text, action, serverId);
+            return;
+        }
+
         if (!isCommandForBot(text)) {
             return;
         }
 
-        String serverId = String.valueOf(selectedServerByChat.get(chatId));
-
-        log.info(serverId);
         log.info("chat_id={} user_id={} username={} text={} serverId={}", chatId, userId, msg.getFrom().getUserName(), text, serverId);
-
-        var action = pending.get(chatId);
-        if (action != null) {
-            handlePending(chatId, userId, text, action, serverId);
-            return;
-        }
 
         String cmd = stripBotUsername(text);
 
