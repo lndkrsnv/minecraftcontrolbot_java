@@ -187,19 +187,34 @@ public class MinecraftControlTelegramBot extends TelegramLongPollingBot {
             }
             case "/save" -> {
                 if (authorizedUsers.contains(userId)) {
-                    rcon.command(serverId, "save-all");
-                    send(chatId, "Сохранение выполнено.");
+                    try {
+                        rcon.command(serverId, "save-all");
+                        send(chatId, "Сохранение выполнено.");
+                    } catch (Exception e) {
+                        log.warn("RCON save command error", e);
+                        send(chatId, "❌ " + getErrorMessage(e));
+                    }
                 } else send(chatId, "Недостаточно прав.");
             }
             case "/restart" -> {
                 if (authorizedUsers.contains(userId)) {
-                    rcon.command(serverId,"stop");
-                    send(chatId, "Сервер перезапускается. Подожди 5 минут");
+                    try {
+                        rcon.command(serverId,"stop");
+                        send(chatId, "Сервер перезапускается. Подожди 5 минут");
+                    } catch (Exception e) {
+                        log.warn("RCON restart command error", e);
+                        send(chatId, "❌ " + getErrorMessage(e));
+                    }
                 } else send(chatId, "Недостаточно прав.");
             }
             case "/toggledownfall" -> {
-                rcon.command(serverId,"weather clear");
-                send(chatId, "Дождь отключен");
+                try {
+                    rcon.command(serverId,"weather clear");
+                    send(chatId, "Дождь отключен");
+                } catch (Exception e) {
+                    log.warn("RCON toggledownfall command error", e);
+                    send(chatId, "❌ " + getErrorMessage(e));
+                }
             }
             case "/sleep" -> handleSleep(chatId, serverId);
             default -> {
@@ -228,8 +243,13 @@ public class MinecraftControlTelegramBot extends TelegramLongPollingBot {
                 return;
             }
             pending.remove(chatId);
-            rcon.command(serverId,"say " + t);
-            send(chatId, "Сообщение отправлено: " + t);
+            try {
+                rcon.command(serverId,"say " + t);
+                send(chatId, "Сообщение отправлено: " + t);
+            } catch (Exception e) {
+                log.warn("RCON say command error", e);
+                send(chatId, "❌ " + getErrorMessage(e));
+            }
             return;
         }
 
@@ -245,7 +265,7 @@ public class MinecraftControlTelegramBot extends TelegramLongPollingBot {
                 send(chatId, "Выполнено успешно: " + t);
             } catch (Exception e) {
                 log.warn("RCON custom command error", e);
-                send(chatId, "❌ Ошибка RCON: " + e.getMessage());
+                send(chatId, "❌ " + getErrorMessage(e));
             }
         }
     }
@@ -255,7 +275,8 @@ public class MinecraftControlTelegramBot extends TelegramLongPollingBot {
             var data = statusClient.fetchStatus(serverId);
             send(chatId, statusFormatter.format(data));
         } catch (Exception e) {
-            send(chatId, "Не удалось получить статус сервера: " + e.getMessage());
+            log.warn("Status fetch error", e);
+            send(chatId, "❌ " + getErrorMessage(e));
         }
     }
 
@@ -283,9 +304,25 @@ public class MinecraftControlTelegramBot extends TelegramLongPollingBot {
             }
         }
         
-        rcon.command(serverId, "time set day");
-        sleepLastUsed.put(key, now);
-        send(chatId, "Настало утро");
+        try {
+            rcon.command(serverId, "time set day");
+            sleepLastUsed.put(key, now);
+            send(chatId, "Настало утро");
+        } catch (Exception e) {
+            log.warn("RCON sleep command error", e);
+            send(chatId, "❌ " + getErrorMessage(e));
+        }
+    }
+    
+    private String getErrorMessage(Exception e) {
+        String message = e.getMessage();
+        if (message != null && message.contains("недоступен")) {
+            return message;
+        }
+        if (message != null && message.contains("превышено время ожидания")) {
+            return message;
+        }
+        return "Бэкенд недоступен: " + (message != null ? message : e.getClass().getSimpleName());
     }
 
     private void send(long chatId, String text) {
