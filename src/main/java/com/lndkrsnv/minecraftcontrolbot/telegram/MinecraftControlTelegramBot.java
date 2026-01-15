@@ -4,6 +4,7 @@ import com.lndkrsnv.minecraftcontrolbot.config.BotProperties;
 import com.lndkrsnv.minecraftcontrolbot.service.RconService;
 import com.lndkrsnv.minecraftcontrolbot.service.StatusClient;
 import com.lndkrsnv.minecraftcontrolbot.service.StatusFormatter;
+import jakarta.annotation.PreDestroy;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.stereotype.Component;
@@ -19,6 +20,9 @@ import org.telegram.telegrambots.meta.api.objects.replykeyboard.buttons.InlineKe
 
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.Executors;
+import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.TimeUnit;
 import java.util.stream.Collectors;
 
 @Component
@@ -31,8 +35,14 @@ public class MinecraftControlTelegramBot extends TelegramLongPollingBot {
     private final StatusFormatter statusFormatter;
 
     private final Set<Long> authorizedUsers;
-    private final ConcurrentHashMap<Long, PendingAction> pending = new ConcurrentHashMap<>();
+    private final ConcurrentHashMap<Long, PendingActionInfo> pending = new ConcurrentHashMap<>();
     private final ConcurrentHashMap<Long, ServerId> selectedServerByChat = new ConcurrentHashMap<>();
+    private final ConcurrentHashMap<Integer, ServerPickerInfo> serverPickerOwnersByMessage = new ConcurrentHashMap<>();
+    private final ConcurrentHashMap<String, Long> sleepLastUsed = new ConcurrentHashMap<>(); // key: "chatId:serverId"
+    private final ScheduledExecutorService cleanupExecutor = Executors.newSingleThreadScheduledExecutor();
+
+    private record PendingActionInfo(PendingAction action, long initiatorUserId, long createdAt) {}
+    private record ServerPickerInfo(long ownerUserId, long chatId, long createdAt) {}
 
     public MinecraftControlTelegramBot(
             BotProperties botProps,
@@ -46,6 +56,76 @@ public class MinecraftControlTelegramBot extends TelegramLongPollingBot {
         this.statusClient = statusClient;
         this.statusFormatter = statusFormatter;
         this.authorizedUsers = parseAuthorized(botProps.authorizedUsers());
+        
+        cleanupExecutor.scheduleAtFixedRate(this::cleanupExpiredActions, 10, 10, TimeUnit.SECONDS);
+    }
+    
+    private void cleanupExpiredActions() {
+        long now = System.currentTimeMillis();
+        long timeoutMs = TimeUnit.SECONDS.toMillis(15);
+        
+        pending.entrySet().removeIf(entry -> {
+            if (now - entry.getValue().createdAt() > timeoutMs) {
+                long chatId = entry.getKey();
+                PendingActionInfo actionInfo = entry.getValue();
+                log.info("Cleaning up expired pending action for chat_id={}, action={}", chatId, actionInfo.action());
+                
+                String message = switch (actionInfo.action()) {
+                    case SAY_TEXT -> "Время вышло. Команда /say отменена.";
+                    case CUSTOM_COMMAND -> "Время вышло. Команда /custom_command отменена.";
+                };
+                send(chatId, message);
+                return true;
+            }
+            return false;
+        });
+        
+        serverPickerOwnersByMessage.entrySet().removeIf(entry -> {
+            if (now - entry.getValue().createdAt() > timeoutMs) {
+                Integer messageId = entry.getKey();
+                ServerPickerInfo pickerInfo = entry.getValue();
+                long chatId = pickerInfo.chatId();
+                log.info("Cleaning up expired server picker for message_id={}, chat_id={}", messageId, chatId);
+                
+                try {
+                    execute(EditMessageReplyMarkup.builder()
+                            .chatId(String.valueOf(chatId))
+                            .messageId(messageId)
+                            .replyMarkup(null)
+                            .build());
+                } catch (TelegramApiException e) {
+                    log.warn("Failed to remove inline keyboard on timeout", e);
+                }
+                
+                send(chatId, "Время вышло. Команда /set_server отменена.");
+                return true;
+            }
+            return false;
+        });
+        
+        // Очистка старых записей sleep (старше 24 часов)
+        long sleepCleanupMs = TimeUnit.HOURS.toMillis(24);
+        sleepLastUsed.entrySet().removeIf(entry -> {
+            if (now - entry.getValue() > sleepCleanupMs) {
+                log.info("Cleaning up old sleep record for key={}", entry.getKey());
+                return true;
+            }
+            return false;
+        });
+    }
+    
+    @PreDestroy
+    public void shutdown() {
+        log.info("Shutting down cleanup executor");
+        cleanupExecutor.shutdown();
+        try {
+            if (!cleanupExecutor.awaitTermination(5, TimeUnit.SECONDS)) {
+                cleanupExecutor.shutdownNow();
+            }
+        } catch (InterruptedException e) {
+            cleanupExecutor.shutdownNow();
+            Thread.currentThread().interrupt();
+        }
     }
 
     @Override
@@ -69,10 +149,10 @@ public class MinecraftControlTelegramBot extends TelegramLongPollingBot {
 
         String serverId = String.valueOf(selectedServerByChat.get(chatId));
 
-        var action = pending.get(chatId);
-        if (action != null) {
-            log.info("chat_id={} user_id={} username={} text={} serverId={} [pending action {}]", chatId, userId, msg.getFrom().getUserName(), text, serverId, action);
-            handlePending(chatId, userId, text, action, serverId);
+        var actionInfo = pending.get(chatId);
+        if (actionInfo != null) {
+            log.info("chat_id={} user_id={} username={} text={} serverId={} [pending action {}]", chatId, userId, msg.getFrom().getUserName(), text, serverId, actionInfo.action());
+            handlePending(chatId, userId, text, actionInfo, serverId);
             return;
         }
 
@@ -86,20 +166,20 @@ public class MinecraftControlTelegramBot extends TelegramLongPollingBot {
 
         if (!cmd.equals("/set_server") && (serverId == null || serverId.isBlank() || "null".equalsIgnoreCase(serverId))) {
             send(chatId, "Сервер не определен");
-            sendServerPicker(chatId);
+            sendServerPicker(chatId, userId);
             return;
         }
 
         switch (cmd) {
-            case "/set_server" -> sendServerPicker(chatId);
+            case "/set_server" -> sendServerPicker(chatId, userId);
             case "/status" -> handleStatus(chatId, serverId);
             case "/say" -> {
-                pending.put(chatId, PendingAction.SAY_TEXT);
+                pending.put(chatId, new PendingActionInfo(PendingAction.SAY_TEXT, userId, System.currentTimeMillis()));
                 send(chatId, "Введи текст для отправки в чат сервера (или /cancel)");
             }
             case "/custom_command" -> {
                 if (userId == botProps.superUser()) {
-                    pending.put(chatId, PendingAction.CUSTOM_COMMAND);
+                    pending.put(chatId, new PendingActionInfo(PendingAction.CUSTOM_COMMAND, userId, System.currentTimeMillis()));
                     send(chatId, "Какую команду выполнить? (/cancel для отмены)");
                 } else {
                     send(chatId, "Недостаточно прав.");
@@ -121,18 +201,20 @@ public class MinecraftControlTelegramBot extends TelegramLongPollingBot {
                 rcon.command(serverId,"weather clear");
                 send(chatId, "Дождь отключен");
             }
-            case "/sleep" -> {
-                rcon.command(serverId,"time set day");
-                send(chatId, "Настало утро");
-            }
+            case "/sleep" -> handleSleep(chatId, serverId);
             default -> {
                 send(chatId, "Неизвестная команда");
             }
         }
     }
 
-    private void handlePending(long chatId, long userId, String text, PendingAction action, String serverId) {
+    private void handlePending(long chatId, long userId, String text, PendingActionInfo actionInfo, String serverId) {
+        if (actionInfo.initiatorUserId() != userId) {
+            return;
+        }
+
         String t = stripBotUsername(text).trim();
+        PendingAction action = actionInfo.action();
 
         if ("/cancel".equals(t)) {
             pending.remove(chatId);
@@ -177,6 +259,35 @@ public class MinecraftControlTelegramBot extends TelegramLongPollingBot {
         }
     }
 
+    private void handleSleep(long chatId, String serverId) {
+        String key = chatId + ":" + serverId;
+        long now = System.currentTimeMillis();
+        long cooldownMs = TimeUnit.MINUTES.toMillis(20);
+        
+        Long lastUsed = sleepLastUsed.get(key);
+        if (lastUsed != null) {
+            long timeSinceLastUse = now - lastUsed;
+            if (timeSinceLastUse < cooldownMs) {
+                long remainingSeconds = TimeUnit.MILLISECONDS.toSeconds(cooldownMs - timeSinceLastUse);
+                long remainingMinutes = remainingSeconds / 60;
+                long remainingSecondsMod = remainingSeconds % 60;
+                
+                String message;
+                if (remainingMinutes > 0) {
+                    message = String.format("Команда /sleep использовалась недавно. Подожди ещё %d мин. %d сек.", remainingMinutes, remainingSecondsMod);
+                } else {
+                    message = String.format("Команда /sleep использовалась недавно. Подожди ещё %d сек.", remainingSecondsMod);
+                }
+                send(chatId, message);
+                return;
+            }
+        }
+        
+        rcon.command(serverId, "time set day");
+        sleepLastUsed.put(key, now);
+        send(chatId, "Настало утро");
+    }
+
     private void send(long chatId, String text) {
         try {
             execute(SendMessage.builder().chatId(String.valueOf(chatId)).text(text).build());
@@ -204,7 +315,7 @@ public class MinecraftControlTelegramBot extends TelegramLongPollingBot {
                 .collect(Collectors.toUnmodifiableSet());
     }
 
-    private void sendServerPicker(long chatId) {
+    private void sendServerPicker(long chatId, long userId) {
         var b1 = InlineKeyboardButton.builder()
                 .text("ATM10")
                 .callbackData("set_server:MODERN")
@@ -220,11 +331,14 @@ public class MinecraftControlTelegramBot extends TelegramLongPollingBot {
                 .build();
 
         try {
-            execute(SendMessage.builder()
+            var sent = execute(SendMessage.builder()
                     .chatId(String.valueOf(chatId))
                     .text("Выбери сервер:")
                     .replyMarkup(markup)
                     .build());
+            if (sent != null && sent.getMessageId() != null) {
+                serverPickerOwnersByMessage.put(sent.getMessageId(), new ServerPickerInfo(userId, chatId, System.currentTimeMillis()));
+            }
         } catch (TelegramApiException e) {
             log.warn("Telegram send error", e);
         }
@@ -235,23 +349,35 @@ public class MinecraftControlTelegramBot extends TelegramLongPollingBot {
         long userId = cq.getFrom().getId();
         String data = cq.getData();
 
-        try {
-            execute(AnswerCallbackQuery.builder()
-                    .callbackQueryId(cq.getId())
-                    .build());
-        } catch (TelegramApiException e) {
-            log.warn("AnswerCallbackQuery error", e);
-        }
-
         if (data != null && data.startsWith("set_server:")) {
+            Integer messageId = cq.getMessage().getMessageId();
+            ServerPickerInfo pickerInfo = serverPickerOwnersByMessage.get(messageId);
+
+            if (pickerInfo != null && pickerInfo.ownerUserId() != userId) {
+                try {
+                    execute(AnswerCallbackQuery.builder()
+                            .callbackQueryId(cq.getId())
+                            .text("Выбрать может только инициатор")
+                            .showAlert(false)
+                            .build());
+                } catch (TelegramApiException e) {
+                    log.warn("AnswerCallbackQuery error (unauthorized)", e);
+                }
+                return;
+            }
+
             var id = data.substring("set_server:".length());
             ServerId server = ServerId.valueOf(id);
             selectedServerByChat.put(chatId, server);
             send(chatId, "Ок, выбран сервер: " + server);
             try {
+                serverPickerOwnersByMessage.remove(messageId);
+                execute(AnswerCallbackQuery.builder()
+                        .callbackQueryId(cq.getId())
+                        .build());
                 execute(EditMessageReplyMarkup.builder()
                         .chatId(String.valueOf(cq.getMessage().getChatId()))
-                        .messageId(cq.getMessage().getMessageId())
+                        .messageId(messageId)
                         .replyMarkup(null)
                         .build());
             } catch (TelegramApiException e) {
